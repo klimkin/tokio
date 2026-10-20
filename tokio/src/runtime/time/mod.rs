@@ -225,12 +225,9 @@ impl Driver {
         match next_wake {
             Some(when) => {
                 let now = rt_handle.clock().now();
-                // Note that we effectively round up to 1ms here - this avoids
-                // very short-duration microsecond-resolution sleeps that the OS
-                // might treat as zero-length.
-                let mut duration = handle
-                    .time_source
-                    .tick_to_duration(when.saturating_sub(handle.time_source.instant_to_tick(now)));
+                // Keep the remaining duration precise. Mio rounds positive epoll/IOCP
+                // timeouts up to milliseconds and preserves nanoseconds for kqueue.
+                let mut duration = handle.time_source.duration_until_tick(when, now);
 
                 if duration > Duration::from_millis(0) {
                     if let Some(limit) = limit {
