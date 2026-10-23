@@ -2,7 +2,6 @@
 
 use std::task::Context;
 
-#[cfg(not(loom))]
 use futures::task::noop_waker_ref;
 
 use crate::loom::sync::atomic::{AtomicBool, Ordering};
@@ -164,32 +163,105 @@ fn inhibition_release_unparks_after_clock_snapshot() {
 }
 
 #[test]
-#[cfg(all(feature = "test-util", not(loom)))]
+#[cfg(feature = "test-util")]
+fn clock_change_unparks_driver() {
+    model(|| {
+        let (mut driver, handle) = paused_driver();
+        let before = handle.clock().now();
+        let duration = std::time::Duration::from_nanos(1);
+        let advance_handle = handle.clone();
+        let advance = thread::spawn(move || {
+            advance_handle.clock().advance(duration).unwrap();
+            advance_handle.unpark();
+        });
+
+        driver.park(&handle);
+
+        assert!(handle.time().did_wake());
+        assert_eq!(handle.clock().now(), before + duration);
+        advance.join().unwrap();
+        driver.shutdown(&handle);
+    });
+}
+
+#[test]
+#[cfg(feature = "test-util")]
 fn manual_resume_notifies_driver() {
-    let rt = rt(true);
-    let _enter = rt.enter();
-    let time = rt.handle().inner.driver().time();
+    model(|| {
+        let rt = rt(true);
+        let _enter = rt.enter();
+        let time = rt.handle().inner.driver().time();
 
-    crate::time::resume();
+        crate::time::resume();
 
-    assert!(time.did_wake(), "manual resume must notify the driver");
+        assert!(time.did_wake(), "manual resume must notify the driver");
+    });
+}
+
+#[test]
+#[cfg(feature = "test-util")]
+fn manual_advance_notifies_driver() {
+    use std::future::Future;
+
+    model(|| {
+        let rt = rt(true);
+        let _enter = rt.enter();
+        let time = rt.handle().inner.driver().time();
+
+        let advance = crate::time::advance(std::time::Duration::from_nanos(1));
+        pin!(advance);
+        let mut cx = Context::from_waker(noop_waker_ref());
+        assert!(advance.as_mut().poll(&mut cx).is_pending());
+
+        assert!(time.did_wake(), "manual advance must notify the driver");
+    });
 }
 
 #[test]
 #[cfg(all(feature = "test-util", not(loom)))]
-fn manual_advance_notifies_driver() {
+fn failed_manual_clock_changes_do_not_notify_driver() {
     use std::future::Future;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
-    let rt = rt(true);
+    let rt = rt(false);
     let _enter = rt.enter();
     let time = rt.handle().inner.driver().time();
+
+    assert!(catch_unwind(crate::time::resume).is_err());
+    assert!(!time.did_wake());
 
     let advance = crate::time::advance(std::time::Duration::from_nanos(1));
     pin!(advance);
     let mut cx = Context::from_waker(noop_waker_ref());
-    assert!(advance.as_mut().poll(&mut cx).is_pending());
+    assert!(catch_unwind(AssertUnwindSafe(|| advance.as_mut().poll(&mut cx))).is_err());
+    assert!(!time.did_wake());
 
-    assert!(time.did_wake(), "manual advance must notify the driver");
+    crate::time::pause();
+    let overflow = crate::time::advance(std::time::Duration::MAX);
+    pin!(overflow);
+    assert!(catch_unwind(AssertUnwindSafe(|| overflow.as_mut().poll(&mut cx))).is_err());
+    assert!(!time.did_wake());
+}
+
+#[test]
+#[cfg(all(feature = "test-util", not(loom)))]
+fn internal_clock_changes_do_not_notify_driver() {
+    let rt = rt(false);
+    let _enter = rt.enter();
+    let driver = rt.handle().inner.driver();
+    let time = driver.time();
+
+    crate::time::pause();
+    assert!(!time.did_wake());
+
+    let _ = crate::time::Instant::now();
+    assert!(!time.did_wake());
+
+    driver
+        .clock()
+        .advance(std::time::Duration::from_nanos(1))
+        .unwrap();
+    assert!(!time.did_wake());
 }
 
 #[test]

@@ -134,6 +134,81 @@ fn spawn_blocking_when_paused() {
     });
 }
 
+#[cfg(feature = "test-util")]
+#[test]
+fn public_advance_returns_parked_backend() {
+    loom::model(|| {
+        let (rt, returned, go) = parked_backend_wait();
+        let handle = rt.handle().clone();
+        let worker = loom::thread::spawn(move || {
+            go.recv();
+            handle.block_on(crate::time::advance(Duration::from_millis(1)));
+        });
+
+        rt.block_on(returned).unwrap();
+        worker.join().unwrap();
+    });
+}
+
+#[cfg(feature = "test-util")]
+#[test]
+fn public_resume_returns_parked_backend() {
+    loom::model(|| {
+        let (rt, returned, go) = parked_backend_wait();
+        let handle = rt.handle().clone();
+        let worker = loom::thread::spawn(move || {
+            go.recv();
+            let _enter = handle.enter();
+            crate::time::resume();
+        });
+
+        rt.block_on(returned).unwrap();
+        worker.join().unwrap();
+    });
+}
+
+#[cfg(feature = "test-util")]
+#[test]
+fn blocking_release_returns_parked_backend() {
+    loom::model(|| {
+        let (rt, returned, go) = parked_backend_wait();
+        drop(rt.spawn_blocking(move || go.recv()));
+
+        rt.block_on(returned).unwrap();
+    });
+}
+
+#[cfg(feature = "test-util")]
+fn parked_backend_wait() -> (
+    Runtime,
+    crate::sync::oneshot::Receiver<()>,
+    super::loom_oneshot::Receiver<()>,
+) {
+    use crate::loom::sync::Mutex;
+
+    let (go_tx, go_rx) = super::loom_oneshot::channel();
+    let (returned_tx, returned_rx) = crate::sync::oneshot::channel();
+    let mut builder = runtime::Builder::new_current_thread();
+    builder.enable_time().start_paused(true);
+    builder.before_park = Some(Arc::new({
+        let go = Mutex::new(Some(go_tx));
+        move || {
+            if let Some(go) = go.lock().take() {
+                go.send(());
+            }
+        }
+    }));
+    builder.after_unpark = Some(Arc::new({
+        let returned = Mutex::new(Some(returned_tx));
+        move || {
+            if let Some(returned) = returned.lock().take() {
+                returned.send(()).unwrap();
+            }
+        }
+    }));
+    (builder.build().unwrap(), returned_rx, go_rx)
+}
+
 #[test]
 /// See <https://github.com/tokio-rs/tokio/pull/7922>
 fn spawn_blocking_then_shutdown() {
