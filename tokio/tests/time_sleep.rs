@@ -127,6 +127,181 @@ async fn sub_ms_deadline_elapses_at_next_ms_tick() {
     assert_ready!(sleep.poll());
 }
 
+#[test]
+fn fractional_sleep_across_wheel_levels() {
+    for boundary_ms in [
+        1,
+        64,
+        4096,
+        262_144,
+        16_777_216,
+        1_073_741_824,
+        68_719_476_736,
+    ] {
+        for phase_ns in [1, 999_999] {
+            for (near_boundary, extra_ns) in [(false, 0), (false, 1), (true, 0), (true, 1)] {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .start_paused(true)
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let start = Instant::now();
+                        let phase = Duration::from_nanos(phase_ns);
+                        let elapsed = if near_boundary {
+                            ms(boundary_ms - 1) + phase
+                        } else {
+                            phase
+                        };
+                        time::advance(elapsed).await;
+
+                        time::sleep_until(start + ms(boundary_ms) + Duration::from_nanos(extra_ns))
+                            .await;
+                        assert_eq!(
+                            start.elapsed(),
+                            ms(boundary_ms + extra_ns),
+                            "boundary {boundary_ms} ms, phase {phase_ns} ns, near {near_boundary}, offset {extra_ns} ns"
+                        );
+                    });
+            }
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn fractional_sleep_across_top_level_rotations() {
+    let start = Instant::now();
+    time::advance(Duration::from_nanos(999_999)).await;
+
+    let deadline_ms = (2_u64 << 36) + 5;
+    let sleep = time::sleep_until(start + ms(deadline_ms) + Duration::from_nanos(1));
+    tokio::pin!(sleep);
+    assert_pending!(futures::poll!(sleep.as_mut()));
+
+    time::sleep_until(start + ms(1)).await;
+    assert_eq!(start.elapsed(), ms(1));
+
+    sleep.await;
+    assert_eq!(start.elapsed(), ms(deadline_ms + 1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn reset_and_reuse_sleep_at_fractional_time() {
+    for (old_ms, new_ms) in [(17, 1), (1, 17), (64, 65), (65, 64)] {
+        time::sleep(ms(1)).await;
+        let start = Instant::now();
+        time::advance(Duration::from_nanos(999_999)).await;
+
+        let sleep = time::sleep_until(start + ms(old_ms));
+        tokio::pin!(sleep);
+        assert_pending!(futures::poll!(sleep.as_mut()));
+        sleep.as_mut().reset(start + ms(new_ms));
+        sleep.as_mut().await;
+        assert_eq!(start.elapsed(), ms(new_ms));
+
+        time::advance(Duration::from_nanos(999_999)).await;
+        sleep.as_mut().reset(start + ms(new_ms + 1));
+        sleep.as_mut().await;
+        assert_eq!(start.elapsed(), ms(new_ms + 1));
+
+        time::advance(Duration::from_nanos(900_000)).await;
+        let before = Instant::now();
+        sleep.as_mut().reset(start + ms(new_ms));
+        assert_ready!(futures::poll!(sleep.as_mut()));
+        assert_eq!(Instant::now(), before);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancel_earliest_sleep_at_fractional_time() {
+    let start = Instant::now();
+    time::advance(ms(63) + Duration::from_nanos(999_999)).await;
+
+    let mut early = Box::pin(time::sleep_until(start + ms(64)));
+    let mut survivor = Box::pin(time::sleep_until(start + ms(65)));
+    assert_pending!(futures::poll!(early.as_mut()));
+    assert_pending!(futures::poll!(survivor.as_mut()));
+
+    drop(early);
+    survivor.await;
+    assert_eq!(start.elapsed(), ms(65));
+}
+
+#[tokio::test(start_paused = true)]
+async fn fractional_deadlines_wake_more_than_one_batch() {
+    let start = Instant::now();
+    time::advance(Duration::from_nanos(999_999)).await;
+
+    let mut sleeps = Vec::new();
+    for index in 0..96 {
+        let offset_ns = [1_000_001, 1_500_000, 1_999_999][index % 3];
+        let mut sleep = task::spawn(time::sleep_until(start + Duration::from_nanos(offset_ns)));
+        assert_pending!(sleep.poll());
+        sleeps.push(sleep);
+    }
+    sleeps.truncate(65);
+    let mut next_tick = task::spawn(Box::pin(time::sleep_until(
+        start + Duration::from_nanos(2_000_001),
+    )));
+    assert_pending!(next_tick.poll());
+
+    time::advance(ms(1)).await;
+    for sleep in &mut sleeps {
+        assert!(!sleep.is_woken());
+        assert_pending!(sleep.poll());
+    }
+
+    time::advance(Duration::from_nanos(1)).await;
+    for sleep in &mut sleeps {
+        assert!(sleep.is_woken());
+        assert_ready!(sleep.poll());
+    }
+    assert_pending!(next_tick.poll());
+    assert_eq!(start.elapsed(), ms(2));
+
+    next_tick.into_inner().await;
+    assert_eq!(start.elapsed(), ms(3));
+}
+
+#[tokio::test(start_paused = true)]
+async fn runnable_yields_preserve_fractional_time() {
+    let start = Instant::now();
+    time::advance(Duration::from_nanos(999_999)).await;
+
+    let sleep = time::sleep_until(start + ms(1));
+    tokio::pin!(sleep);
+    assert_pending!(futures::poll!(sleep.as_mut()));
+
+    for _ in 0..128 {
+        tokio::task::yield_now().await;
+        assert_eq!(start.elapsed(), Duration::from_nanos(999_999));
+    }
+
+    sleep.await;
+    assert_eq!(start.elapsed(), ms(1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn resume_and_pause_preserve_timer_epoch() {
+    let start = Instant::now();
+    let sleep = time::sleep(Duration::from_secs(10));
+    tokio::pin!(sleep);
+    assert_pending!(futures::poll!(sleep.as_mut()));
+
+    time::resume();
+    std::thread::sleep(Duration::from_micros(70));
+    time::pause();
+
+    let deadline = Instant::now() + Duration::from_nanos(500_001);
+    let expected_ms = deadline
+        .duration_since(start)
+        .as_nanos()
+        .div_ceil(1_000_000) as u64;
+    sleep.as_mut().reset(deadline);
+    sleep.await;
+    assert_eq!(start.elapsed(), ms(expected_ms));
+}
+
 #[tokio::test]
 async fn delayed_sleep_wrapping_level_0() {
     time::pause();

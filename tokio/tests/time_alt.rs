@@ -80,6 +80,73 @@ fn sleep() {
 }
 
 #[test]
+fn cancel_and_reset_do_not_hide_remote_timer() {
+    use std::sync::mpsc;
+    use tokio::sync::oneshot;
+
+    for enable_io in [false, true] {
+        for (workers, enable_alt_timer) in [(1, false), (4, false), (1, true), (4, true)] {
+            let mut builder = tokio::runtime::Builder::new_multi_thread();
+            builder.worker_threads(workers).enable_time();
+            if enable_alt_timer {
+                builder.enable_alt_timer();
+            }
+            if enable_io {
+                builder.enable_io();
+            }
+            let rt = builder.build().unwrap();
+            let result = (|| {
+                for offset_ns in [1, 999_999] {
+                    let (armed_tx, armed_rx) = mpsc::channel();
+                    let (command_tx, command_rx) = oneshot::channel();
+                    let (done_tx, done_rx) = mpsc::channel();
+
+                    rt.spawn(async move {
+                        let mut cancelled = Box::pin(tokio::time::sleep(Duration::from_secs(600)));
+                        let mut survivor = Box::pin(tokio::time::sleep(Duration::from_secs(601)));
+                        std::future::poll_fn(|cx| {
+                            assert_pending!(cancelled.as_mut().poll(cx));
+                            assert_pending!(survivor.as_mut().poll(cx));
+                            std::task::Poll::Ready(())
+                        })
+                        .await;
+                        armed_tx.send(()).unwrap();
+
+                        let remote: tokio::task::JoinHandle<()> = command_rx.await.unwrap();
+                        drop(cancelled);
+                        let deadline = Instant::now() + Duration::from_nanos(offset_ns);
+                        survivor.as_mut().reset(deadline);
+                        survivor.await;
+                        assert!(Instant::now() >= deadline);
+                        remote.await.unwrap();
+                        done_tx.send(()).unwrap();
+                    });
+
+                    armed_rx.recv_timeout(Duration::from_secs(5))?;
+                    let (remote_sleep, deadline) = {
+                        let _guard = rt.enter();
+                        let deadline = Instant::now() + Duration::from_micros(500);
+                        let mut sleep = Box::pin(tokio::time::sleep_until(deadline));
+                        let _ = sleep.as_mut().poll(&mut noop_context());
+                        (sleep, deadline)
+                    };
+                    let remote = rt.spawn(async move {
+                        remote_sleep.await;
+                        assert!(Instant::now() >= deadline);
+                    });
+                    command_tx.send(remote).unwrap();
+                    done_rx.recv_timeout(Duration::from_secs(5))?;
+                }
+                Ok::<_, mpsc::RecvTimeoutError>(())
+            })();
+
+            rt.shutdown_timeout(Duration::from_secs(1));
+            result.unwrap();
+        }
+    }
+}
+
+#[test]
 fn cancelled_timer_waker_drop_can_register_timer() {
     use futures::FutureExt;
     use std::future::Future;

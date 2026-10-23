@@ -36,6 +36,20 @@ async fn can_pause_after_resume() {
     assert!(Instant::now() - start < Duration::from_secs(21));
 }
 
+#[tokio::test(start_paused = true)]
+async fn repeated_clock_changes_preserve_deadlines() {
+    for _ in 0..32 {
+        time::resume();
+        time::pause();
+        let start = Instant::now();
+        time::advance(Duration::from_millis(1)).await;
+        assert_eq!(start.elapsed(), Duration::from_millis(1));
+        time::sleep_until(start + Duration::from_millis(2)).await;
+        assert!(start.elapsed() >= Duration::from_millis(2));
+        assert!(start.elapsed() < Duration::from_millis(3));
+    }
+}
+
 #[tokio::test]
 #[should_panic]
 async fn freezing_time_while_frozen_panics() {
