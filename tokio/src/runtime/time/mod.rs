@@ -25,6 +25,8 @@ use crate::loom::sync::atomic::{AtomicBool, Ordering};
 use crate::loom::sync::Mutex;
 use crate::runtime::driver::{self, IoHandle, IoStack};
 use crate::time::error::Error;
+#[cfg(feature = "test-util")]
+use crate::time::ClockState;
 use crate::time::{Clock, Duration, Instant};
 use crate::util::WakeList;
 
@@ -227,21 +229,17 @@ impl Driver {
                 let now = rt_handle.clock().now();
                 // Keep the remaining duration precise. Mio rounds positive epoll/IOCP
                 // timeouts up to milliseconds and preserves nanoseconds for kqueue.
-                let mut duration = handle.time_source.duration_until_tick(when, now);
+                let duration = handle.time_source.duration_until_tick(when, now);
 
                 if duration > Duration::from_millis(0) {
-                    if let Some(limit) = limit {
-                        duration = std::cmp::min(limit, duration);
-                    }
-
-                    self.park_thread_timeout(rt_handle, Some(now), duration);
+                    self.park_thread_timeout(rt_handle, Some(now), duration, limit);
                 } else {
                     self.park.park_timeout(rt_handle, Duration::from_secs(0));
                 }
             }
             None => {
                 if let Some(duration) = limit {
-                    self.park_thread_timeout(rt_handle, None, duration);
+                    self.park_thread_timeout(rt_handle, None, duration, Some(duration));
                 } else {
                     self.park.park(rt_handle);
                 }
@@ -259,12 +257,15 @@ impl Driver {
             rt_handle: &driver::Handle,
             now: Option<Instant>,
             duration: Duration,
+            limit: Option<Duration>,
         ) {
             let handle = rt_handle.time();
             let clock = rt_handle.clock();
             let now = now.unwrap_or_else(|| clock.now());
+            let clock_state = clock.state();
+            let duration = park_timeout_duration(clock_state, duration, limit);
 
-            if clock.can_auto_advance() {
+            if clock_state == ClockState::Paused {
                 self.park.park_timeout(rt_handle, Duration::from_secs(0));
 
                 // If the time driver was woken, then the park completed
@@ -287,10 +288,27 @@ impl Driver {
             rt_handle: &driver::Handle,
             _now: Option<Instant>,
             duration: Duration,
+            limit: Option<Duration>,
         ) {
+            let duration = limit.map_or(duration, |limit| duration.min(limit));
             self.park.park_timeout(rt_handle, duration);
         }
     }
+}
+
+#[cfg(feature = "test-util")]
+fn park_timeout_duration(
+    clock_state: ClockState,
+    duration: Duration,
+    limit: Option<Duration>,
+) -> Duration {
+    let duration = if clock_state == ClockState::PausedInhibited && !duration.is_zero() {
+        duration.max(Duration::from_millis(1))
+    } else {
+        duration
+    };
+
+    limit.map_or(duration, |limit| duration.min(limit))
 }
 
 impl Handle {
